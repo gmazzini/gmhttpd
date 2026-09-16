@@ -37,7 +37,7 @@ The Makefile uses:
 
 `server` stays in the foreground and is the correct mode under systemd.
 
-`stats` reports uptime, accepted connections, active requests, valid HTTP requests, rejected connections and per-vhost request counters.
+`stats` reports uptime, accepted connections, active requests, valid HTTP requests, rejected connections, successfully served ACME challenges and per-vhost request counters.
 
 ## Configuration
 
@@ -49,7 +49,15 @@ The configuration must contain exactly one directive defining the HTTP and HTTPS
 ports 80 443
 ```
 
-HTTP requests are redirected to HTTPS with status `308 Permanent Redirect`.
+An optional ACME directory can be configured for Certbot/Let's Encrypt HTTP-01 validation:
+
+```text
+acme acme
+```
+
+The path is relative to the gmhttpd working directory when a relative name is used. With the standard systemd setup above, `acme acme` means `/home/tools/mcp/work/gmhttpd/acme`. No hidden `.well-known` directory is created on disk.
+
+HTTP requests are redirected to HTTPS with status `308 Permanent Redirect`, except valid `/.well-known/acme-challenge/<token>` requests when ACME support is configured.
 
 There is no default virtual host. Unknown Host/SNI names are rejected.
 
@@ -194,6 +202,52 @@ HTTP_SEC_PURPOSE
 ```
 
 `Status:` emitted by CGI is translated into the HTTP response status. HEAD responses suppress the body.
+
+## ACME and Certbot
+
+The optional `acme` directive removes the need for an Apache-based Certbot authenticator.
+
+Example:
+
+```text
+acme acme
+```
+
+Certbot challenge tokens are stored directly as ordinary files in:
+
+```text
+/home/tools/mcp/work/gmhttpd/acme/<token>
+```
+
+The project includes two small Certbot hooks:
+
+```text
+auth   writes acme/$CERTBOT_TOKEN
+clean  removes acme/$CERTBOT_TOKEN
+```
+
+They use the standard `CERTBOT_TOKEN` and `CERTBOT_VALIDATION` environment variables supplied by Certbot. This avoids a filesystem `.well-known` directory and removes the dependency on the Apache Certbot plugin.
+
+gmhttpd exposes those files only on plain HTTP through the protocol-defined URL:
+
+```text
+/.well-known/acme-challenge/<token>
+```
+
+The `.well-known` component exists only in the public URL required by ACME; it is not created in the filesystem. Token names are restricted to letters, digits, `-` and `_`, and only regular files are served. GET and HEAD are accepted. All other HTTP paths keep their normal redirect behavior. Successfully served challenges are counted in the `acme` field of `gmhttpd stats`.
+
+Certbot should use the `manual` authenticator with the two hooks above and a deploy hook that restarts `gmhttpd` after a successful renewal, because TLS certificates are loaded at server startup. For example:
+
+```sh
+certbot reconfigure --cert-name www.example.org \
+  --authenticator manual \
+  --preferred-challenges http \
+  --manual-auth-hook /home/tools/mcp/work/gmhttpd/auth \
+  --manual-cleanup-hook /home/tools/mcp/work/gmhttpd/clean \
+  --deploy-hook "systemctl restart gmhttpd"
+```
+
+After a certificate renewal, gmhttpd must be restarted because TLS certificates are loaded at startup. A Certbot deploy hook should therefore restart the service after a successful renewal.
 
 ## TLS and networking
 

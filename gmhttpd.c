@@ -1,4 +1,4 @@
-// Gianluca Mazzini @2026- Version 1.23
+// Gianluca Mazzini @2026- Version 1.26
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -74,6 +74,7 @@ static int nhosts;
 static int nproxies;
 static int http_port;
 static int https_port;
+static char acme_root[1024];
 static int pid_fd = -1;
 
 struct server_stats {
@@ -82,13 +83,14 @@ struct server_stats {
     unsigned long long active;
     unsigned long long requests;
     unsigned long long rejected;
+    unsigned long long acme;
     unsigned long long host_requests[MAX_HOSTS];
 };
 
 static struct server_stats *stats;
 
 static const char gmhttpd_help[] =
-    "gmhttpd 1.23\n"
+    "gmhttpd 1.26\n"
     "Usage:\n"
     "  ./gmhttpd\n"
     "  ./gmhttpd start\n"
@@ -233,8 +235,8 @@ static int control_request(int fd)
 
     format_uptime(uptime, sizeof(uptime), time(NULL) - stats->startup);
     len = snprintf(out, sizeof(out),
-        "gmhttpd 1.23 http=%d https=%d uptime=%s connections=%llu active=%llu requests=%llu rejected=%llu\n",
-        http_port, https_port, uptime, stats->connections, stats->active, stats->requests, stats->rejected);
+        "gmhttpd 1.26 http=%d https=%d uptime=%s connections=%llu active=%llu requests=%llu rejected=%llu acme=%llu\n",
+        http_port, https_port, uptime, stats->connections, stats->active, stats->requests, stats->rejected, stats->acme);
     if (len > 0)
         write(fd, out, (size_t)len);
     for (i = 0; i < nhosts; i++) {
@@ -281,6 +283,7 @@ static int load_config(const char *name)
     int p1;
     int p2;
     int ports_seen;
+    int acme_seen;
     int fields;
 
     f = fopen(name, "r");
@@ -293,7 +296,9 @@ static int load_config(const char *name)
     nproxies = 0;
     http_port = 0;
     https_port = 0;
+    acme_root[0] = '\0';
     ports_seen = 0;
+    acme_seen = 0;
     while (fgets(line, sizeof(line), f) != NULL) {
         if (line[0] == '#' || line[0] == '\n' || line[0] == '\0')
             continue;
@@ -309,6 +314,17 @@ static int load_config(const char *name)
             http_port = p1;
             https_port = p2;
             ports_seen = 1;
+            continue;
+        }
+        if (strcmp(tag, "acme") == 0) {
+            extra[0] = '\0';
+            fields = sscanf(line, "%31s %1023s %1s", tag, acme_root, extra);
+            if (acme_seen || fields != 2 || acme_root[0] == '\0') {
+                fprintf(stderr, "invalid acme line: %s", line);
+                fclose(f);
+                return -1;
+            }
+            acme_seen = 1;
             continue;
         }
         if (strcmp(tag, "proxy") == 0) {
@@ -1125,7 +1141,7 @@ static void run_program(SSL *ssl, struct vhost *h, const struct request_info *r,
         close(outpipe[1]);
         setenv("GATEWAY_INTERFACE", "CGI/1.1", 1);
         setenv("SERVER_PROTOCOL", "HTTP/1.1", 1);
-        setenv("SERVER_SOFTWARE", "gmhttpd/1.23", 1);
+        setenv("SERVER_SOFTWARE", "gmhttpd/1.26", 1);
         setenv("SERVER_NAME", r->host, 1);
         snprintf(length_text, sizeof(length_text), "%d", https_port);
         setenv("SERVER_PORT", length_text, 1);
@@ -1228,6 +1244,69 @@ static void send_plain_simple(int fd, int code, const char *text)
         write(fd, buf, (size_t)n);
 }
 
+static int send_acme_challenge(int fd, const struct request_info *r)
+{
+    static const char prefix[] = "/.well-known/acme-challenge/";
+    struct stat st;
+    char path[MAX_PATH_LEN];
+    char header[512];
+    char buf[4096];
+    const char *token;
+    const char *p;
+    ssize_t n;
+    int file_fd;
+    int len;
+
+    if (acme_root[0] == '\0' || strncmp(r->path, prefix, sizeof(prefix) - 1) != 0)
+        return 0;
+    token = r->path + sizeof(prefix) - 1;
+    if (*token == '\0') {
+        send_plain_simple(fd, 404, "Not Found");
+        return 1;
+    }
+    for (p = token; *p != '\0'; p++) {
+        if (!((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') ||
+            (*p >= '0' && *p <= '9') || *p == '-' || *p == '_')) {
+            send_plain_simple(fd, 404, "Not Found");
+            return 1;
+        }
+    }
+    if (strcmp(r->method, "GET") != 0 && strcmp(r->method, "HEAD") != 0) {
+        send_plain_simple(fd, 405, "Method Not Allowed");
+        return 1;
+    }
+    if (snprintf(path, sizeof(path), "%s/%s", acme_root, token) >= (int)sizeof(path)) {
+        send_plain_simple(fd, 404, "Not Found");
+        return 1;
+    }
+    file_fd = open(path, O_RDONLY);
+    if (file_fd < 0 || fstat(file_fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+        if (file_fd >= 0)
+            close(file_fd);
+        send_plain_simple(fd, 404, "Not Found");
+        return 1;
+    }
+    len = snprintf(header, sizeof(header),
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %lld\r\nConnection: close\r\n\r\n",
+        (long long)st.st_size);
+    if (len <= 0 || len >= (int)sizeof(header) || write_all_fd(fd, header, (size_t)len) < 0) {
+        close(file_fd);
+        return 1;
+    }
+    if (strcmp(r->method, "HEAD") != 0) {
+        for (;;) {
+            n = read(file_fd, buf, sizeof(buf));
+            if (n <= 0)
+                break;
+            if (write_all_fd(fd, buf, (size_t)n) < 0)
+                break;
+        }
+    }
+    close(file_fd);
+    __sync_fetch_and_add(&stats->acme, 1);
+    return 1;
+}
+
 static void send_target_redirect_plain(int fd, const char *target)
 {
     char buf[MAX_PATH_LEN + 128];
@@ -1288,6 +1367,7 @@ static void handle_plain_client(int fd)
         if (hi < 0) {
             __sync_fetch_and_add(&stats->rejected, 1);
             send_plain_simple(fd, 421, "Misdirected Request");
+        } else if (send_acme_challenge(fd, &r)) {
         } else if (hosts[hi].redirect[0] != '\0')
             send_target_redirect_plain(fd, hosts[hi].redirect);
         else
